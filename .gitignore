@@ -1,0 +1,8 @@
+/.tools/
+/target/
+/dist/
+/data/
+/analysis/geek/*.exe
+/analysis/geek/rea-evidence.json
+*.pdb
+

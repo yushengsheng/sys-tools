@@ -1,0 +1,96 @@
+name: Windows build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\cargo\registry
+            ~\AppData\Local\cargo\git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run library tests
+        shell: pwsh
+        run: cargo test --locked --lib --target x86_64-pc-windows-msvc
+
+      - name: Build release executable
+        shell: pwsh
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Verify executable and administrator manifest
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\systools.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Release executable was not produced: $exe" }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $text = [Text.Encoding]::UTF8.GetString($bytes) + [Text.Encoding]::Unicode.GetString($bytes)
+          if ($text -notmatch 'requireAdministrator') { throw 'The executable does not contain a requireAdministrator manifest.' }
+          Write-Host "Verified $exe ($((Get-Item -LiteralPath $exe).Length) bytes)."
+
+      - name: Package Windows x64 archive
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'Could not read package version from Cargo.toml.' }
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $stage = Join-Path $dist "systools-$version-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\systools.exe') -Destination $stage
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'README.md') -Destination $stage
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'LICENSE') -Destination $stage
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'THIRD_PARTY_NOTICES.md') -Destination $stage
+          $zip = Join-Path $dist "systools-$version-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $(Split-Path -Leaf $zip)" -Encoding ascii
+          Write-Host "Created $zip and $zip.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: systools-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+      - name: Publish GitHub release for version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") { throw "Tag $tag does not match Cargo.toml version v$version." }
+          $zip = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'dist') -Filter '*.zip' -File | Select-Object -First 1
+          $checksum = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'dist') -Filter '*.sha256' -File | Select-Object -First 1
+          if (-not $zip -or -not $checksum) { throw 'Release assets were not produced.' }
+          gh release create $tag $zip.FullName $checksum.FullName --title "sys tools $tag" --generate-notes
