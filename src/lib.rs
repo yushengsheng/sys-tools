@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod bitbrowser;
 pub mod cleanup;
 pub mod disk;
 pub mod migration;

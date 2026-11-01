@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, Sender}};
 use std::time::{Duration, Instant};
-use systools::{apps::{self, App}, disk, format_size, migration::{self, History, Phase, Record}, platform::{self, wide, Handle}, residue::{self, Residue}, Result};
+use systools::{apps::{self, App}, bitbrowser, disk, format_size, migration::{self, History, Phase, Record}, platform::{self, wide, Handle}, residue::{self, Residue}, Result};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -20,13 +20,15 @@ const APP_CATEGORY_LABEL: u16 = 111; const APP_CATEGORY_FIRST: u16 = 112; const 
 const CLEAN_INFO: u16 = 200; const SCAN: u16 = 201; const SELECT_ALL: u16 = 202; const CLEAN: u16 = 203; const FILES: u16 = 204; const DRIVE_PICK: u16 = 205; const CATEGORY_PICK: u16 = 206; const FAST_TEMP_SCAN: u16 = 207;
 const SOURCE: u16 = 300; const DESTINATION: u16 = 301; const CHOOSE_SOURCE: u16 = 302; const CHOOSE_DEST: u16 = 303; const MIGRATE: u16 = 304; const MIGRATION_NOTE: u16 = 305; const HISTORY: u16 = 306; const RESTORE: u16 = 307; const RELEASE: u16 = 308; const REPAIR: u16 = 309; const OPEN_TARGET: u16 = 310;
 const PURGE_HISTORY: u16 = 311;
+const BIT_ROOT: u16 = 400; const BIT_CHOOSE: u16 = 401; const BIT_SCAN: u16 = 402; const BIT_SELECT_ALL: u16 = 403; const BIT_CLEAN: u16 = 404; const BIT_INFO: u16 = 405; const BIT_FILES: u16 = 406; const BIT_ROOT_LABEL: u16 = 407;
 const CTX_OPEN_SOURCE: u16 = 5001; const CTX_OPEN_TARGET: u16 = 5002; const CTX_RESTORE: u16 = 5003; const CTX_RELEASE: u16 = 5004; const CTX_REPAIR: u16 = 5005; const CTX_PURGE: u16 = 5006;
 const STATUS: u16 = 900; const PROGRESS: u16 = 901; const CANCEL: u16 = 902; const ADMIN: u16 = 903;
 const CLASS_NAME: &str = "QingzhouSysToolsNative";
-const MUTATING: &[u16] = &[REFRESH, UNINSTALL, USE_APP, APP_CATEGORY_FIRST, APP_CATEGORY_FIRST + 1, APP_CATEGORY_FIRST + 2, APP_CATEGORY_FIRST + 3, SCAN, FAST_TEMP_SCAN, SELECT_ALL, CLEAN, MIGRATE, SOURCE, DESTINATION, CHOOSE_SOURCE, CHOOSE_DEST, RESTORE, RELEASE, REPAIR, PURGE_HISTORY, ADMIN];
+const MUTATING: &[u16] = &[REFRESH, UNINSTALL, USE_APP, APP_CATEGORY_FIRST, APP_CATEGORY_FIRST + 1, APP_CATEGORY_FIRST + 2, APP_CATEGORY_FIRST + 3, SCAN, FAST_TEMP_SCAN, SELECT_ALL, CLEAN, MIGRATE, SOURCE, DESTINATION, CHOOSE_SOURCE, CHOOSE_DEST, RESTORE, RELEASE, REPAIR, PURGE_HISTORY, BIT_ROOT, BIT_CHOOSE, BIT_SCAN, BIT_SELECT_ALL, BIT_CLEAN, ADMIN];
 
 enum Event {
     Apps(Result<Vec<App>>),
+    Bit(Result<bitbrowser::Scan>),
     Disk(Result<disk::Scan>),
     Progress(String),
     Action(Result<String>, bool),
@@ -55,6 +57,7 @@ struct Ui {
     rx: Receiver<Event>,
     smoke: Option<Instant>,
     pending_residues: Option<Vec<Residue>>,
+    bit_scan: Option<bitbrowser::Scan>,
 }
 
 impl Ui {
@@ -103,9 +106,9 @@ impl Ui {
         self.label(11, "sys tools");
         unsafe { SendMessageW(self.control(11), WM_SETFONT, self.title_font as usize, 0); }
         self.label(12, "软件、空间与迁移");
-        self.label(13, "0.1 · 本机运行");
+        self.label(13, "0.2 · 本机运行");
         let tab = self.add(TAB, "SysTabControl32", "", WS_TABSTOP, 0);
-        for (i, title) in ["软件管理", "磁盘清理", "迁移与恢复"].iter().enumerate() {
+        for (i, title) in ["软件管理", "磁盘清理", "迁移与恢复", "比特浏览器清理"].iter().enumerate() {
             let mut name = wide(title);
             let item = TCITEMW { mask: TCIF_TEXT, pszText: name.as_mut_ptr(), ..unsafe { std::mem::zeroed() } };
             unsafe { SendMessageW(tab, TCM_INSERTITEMW, i, &item as *const _ as isize); }
@@ -137,6 +140,11 @@ impl Ui {
         self.label(322, "迁移记录");
         self.list(HISTORY, &[("目录", 175), ("状态", 235), ("原位置", 285), ("目标位置", 285)], false);
         self.button(RESTORE, "恢复原位置…"); self.button(RELEASE, "确认可用，释放副本…"); self.button(REPAIR, "修复中断记录"); self.button(OPEN_TARGET, "打开目标目录"); self.button(PURGE_HISTORY, "清理已完成记录");
+        self.label(BIT_INFO, "连接比特浏览器本地接口，读取当前窗口 ID 后比对缓存目录。只清理确认不存在于当前窗口列表的 32 位窗口目录；扫描不会删除文件。请先启动并登录比特浏览器。");
+        self.label(BIT_ROOT_LABEL, "缓存目录");
+        self.add(BIT_ROOT, "EDIT", &bitbrowser::default_root().display().to_string(), WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE);
+        self.button(BIT_CHOOSE, "选择缓存目录…"); self.button(BIT_SCAN, "扫描窗口缓存"); self.button(BIT_SELECT_ALL, "全选残留"); self.button(BIT_CLEAN, "清理已确认残留…");
+        self.list(BIT_FILES, &[("状态", 125), ("窗口 ID", 285), ("大小", 110), ("文件数", 90), ("路径", 520)], true);
         self.label(STATUS, "正在读取软件列表…");
         self.add(PROGRESS, "msctls_progress32", "", PBS_MARQUEE, 0);
         self.button(CANCEL, "取消 / 停止等待"); self.button(ADMIN, "管理员运行");
@@ -148,34 +156,83 @@ impl Ui {
     fn place(&self, id: u16, x: i32, y: i32, width: i32, height: i32) {
         unsafe { MoveWindow(self.control(id), self.px(x), self.px(y), self.px(width.max(1)), self.px(height.max(1)), 1); }
     }
+    fn button_width(&self, text: &str, minimum: i32) -> i32 {
+        // Native buttons do not auto-size their caption. Reserve one logical
+        // glyph width per Chinese character plus padding, then honor the
+        // historical minimum so the row remains stable at the minimum window size.
+        (text.chars().count() as i32 * 16 + 32).max(minimum)
+    }
+    fn place_right_row(&self, y: i32, right: i32, gap: i32, buttons: &[(u16, &str, i32)]) {
+        let widths = buttons.iter().map(|(_, text, minimum)| self.button_width(text, *minimum)).collect::<Vec<_>>();
+        let mut x = right - widths.iter().sum::<i32>() - gap * buttons.len().saturating_sub(1) as i32;
+        for ((id, _, _), width) in buttons.iter().zip(widths) {
+            self.place(*id, x, y, width, 31);
+            x += width + gap;
+        }
+    }
     fn layout(&self) {
         let mut r = RECT::default(); unsafe { GetClientRect(self.hwnd, &mut r); }
         let w = (r.right as f32 / self.scale) as i32; let h = (r.bottom as f32 / self.scale) as i32;
         self.place(11, 24, 15, 150, 36); self.place(12, 190, 25, 350, 26); self.place(13, w - 155, 26, 135, 22);
         self.place(TAB, 20, 67, w - 40, h - 137);
-        self.place(SEARCH, 38, 112, w - 196, 30); self.place(REFRESH, w - 146, 112, 108, 30);
+        let refresh_width = self.button_width("刷新列表", 108);
+        self.place(SEARCH, 38, 112, (w - 196).max(220), 30); self.place(REFRESH, w - 38 - refresh_width, 112, refresh_width, 30);
         self.place(APPS, 38, 154, w - 76, h - 385);
         self.place(APP_CATEGORY_LABEL, 40, h - 220, 145, 24);
         let category_width = ((w - 205) / 4).max(120);
         for (offset, id) in (APP_CATEGORY_FIRST..=APP_CATEGORY_LAST).enumerate() { self.place(id, 190 + offset as i32 * category_width, h - 225, category_width - 6, 31); }
         self.place(APP_DETAIL, 40, h - 177, w - 80, 52);
-        self.place(UNINSTALL, 38, h - 115, 155, 31); self.place(OPEN_APP, 204, h - 115, 140, 31); self.place(USE_APP, 355, h - 115, 140, 31);
+        self.place(UNINSTALL, 38, h - 115, self.button_width("卸载所选软件…", 155), 31);
+        self.place(OPEN_APP, 204, h - 115, self.button_width("打开所在目录", 140), 31);
+        self.place(USE_APP, 355, h - 115, self.button_width("准备迁移…", 140), 31);
         self.place(CLEAN_INFO, 40, 113, w - 80, 48); self.place(DRIVE_PICK, 40, 168, 110, 31); self.place(CATEGORY_PICK, 160, 168, 155, 31);
-        let clean_x = w - 200;
-        self.place(SCAN, 326, 168, 145, 31); self.place(SELECT_ALL, clean_x - 240, 168, 85, 31); self.place(FAST_TEMP_SCAN, clean_x - 148, 168, 140, 31); self.place(CLEAN, clean_x, 168, 162, 31);
-        self.place(FILES, 38, 212, w - 76, h - 302);
-        self.place(320, 40, 119, 95, 22); self.place(SOURCE, 135, 112, w - 270, 30); self.place(CHOOSE_SOURCE, w - 124, 112, 86, 30);
-        self.place(321, 40, 161, 95, 22); self.place(DESTINATION, 135, 154, w - 270, 30); self.place(CHOOSE_DEST, w - 124, 154, 86, 30);
-        self.place(MIGRATION_NOTE, 40, 199, w - 255, 70); self.place(MIGRATE, w - 196, 209, 158, 34);
+        let scan_width = self.button_width("扫描所选磁盘", 145);
+        let select_width = self.button_width("全选可清理项", 85);
+        let fast_width = self.button_width("快速扫描临时文件", 140);
+        let clean_width = self.button_width("清理勾选项…", 162);
+        let files_y = if w >= 1000 {
+            let clean_x = w - 38 - clean_width;
+            let fast_x = clean_x - 11 - fast_width;
+            let select_x = fast_x - 11 - select_width;
+            self.place(SCAN, 326, 168, scan_width, 31);
+            self.place(SELECT_ALL, select_x, 168, select_width, 31);
+            self.place(FAST_TEMP_SCAN, fast_x, 168, fast_width, 31);
+            self.place(CLEAN, clean_x, 168, clean_width, 31);
+            212
+        } else {
+            // At the minimum window width the four action captions cannot
+            // fit on one line. Keep every caption fully visible by wrapping
+            // the three destructive/selection actions onto a second row.
+            self.place(SCAN, 326, 168, scan_width, 31);
+            self.place(SELECT_ALL, 40, 205, select_width, 31);
+            self.place(FAST_TEMP_SCAN, 40 + select_width + 11, 205, fast_width, 31);
+            self.place(CLEAN, 40 + select_width + fast_width + 22, 205, clean_width, 31);
+            250
+        };
+        self.place(FILES, 38, files_y, w - 76, h - files_y - 90);
+        let choose_source_width = self.button_width("选择…", 86);
+        let choose_dest_width = self.button_width("选择…", 86);
+        self.place(320, 40, 119, 95, 22); self.place(SOURCE, 135, 112, w - 135 - choose_source_width - 49, 30); self.place(CHOOSE_SOURCE, w - 38 - choose_source_width, 112, choose_source_width, 30);
+        self.place(321, 40, 161, 95, 22); self.place(DESTINATION, 135, 154, w - 135 - choose_dest_width - 49, 30); self.place(CHOOSE_DEST, w - 38 - choose_dest_width, 154, choose_dest_width, 30);
+        let migrate_width = self.button_width("校验并迁移…", 158);
+        self.place(MIGRATION_NOTE, 40, 199, w - migrate_width - 95, 70); self.place(MIGRATE, w - 38 - migrate_width, 209, migrate_width, 34);
         self.place(322, 40, 277, 120, 23); self.place(HISTORY, 38, 306, w - 76, h - 442);
-        self.place(RESTORE, 38, h - 115, 145, 31); self.place(RELEASE, 194, h - 115, 204, 31); self.place(REPAIR, 409, h - 115, 145, 31); self.place(OPEN_TARGET, 565, h - 115, 145, 31); self.place(PURGE_HISTORY, 720, h - 115, 160, 31);
-        self.place(STATUS, 24, h - 53, w - 354, 36); self.place(PROGRESS, 24, h - 14, w - 48, 3);
-        self.place(CANCEL, w - 318, h - 51, 165, 30); self.place(ADMIN, w - 143, h - 51, 119, 30);
+        self.place_right_row(h - 115, w - 38, 11, &[(RESTORE, "恢复原位置…", 145), (RELEASE, "确认可用，释放副本…", 204), (REPAIR, "修复中断记录", 145), (OPEN_TARGET, "打开目标目录", 145), (PURGE_HISTORY, "清理已完成记录", 160)]);
+        self.place(BIT_INFO, 40, 112, w - 80, 46); self.place(BIT_ROOT_LABEL, 40, 171, 75, 22);
+        let bit_scan_width = self.button_width("扫描窗口缓存", 120); let bit_choose_width = self.button_width("选择缓存目录…", 145); let bit_right = w - 38;
+        let bit_scan_x = bit_right - bit_scan_width; let bit_choose_x = bit_scan_x - 11 - bit_choose_width;
+        self.place(BIT_ROOT, 118, 166, (bit_choose_x - 11 - 118).max(180), 30); self.place(BIT_CHOOSE, bit_choose_x, 166, bit_choose_width, 30); self.place(BIT_SCAN, bit_scan_x, 166, bit_scan_width, 30);
+        self.place_right_row(208, w - 38, 11, &[(BIT_SELECT_ALL, "全选残留", 120), (BIT_CLEAN, "清理已确认残留…", 175)]);
+        self.place(BIT_FILES, 38, 250, w - 76, h - 340);
+        let cancel_width = self.button_width("取消 / 停止等待", 165); let admin_width = self.button_width("管理员运行", 119);
+        let admin_x = w - 24 - admin_width; let cancel_x = admin_x - 11 - cancel_width;
+        self.place(STATUS, 24, h - 53, (cancel_x - 35).max(220), 36); self.place(PROGRESS, 24, h - 14, w - 48, 3);
+        self.place(CANCEL, cancel_x, h - 51, cancel_width, 30); self.place(ADMIN, admin_x, h - 51, admin_width, 30);
     }
     fn show_page(&mut self, page: i32) {
         self.page = page;
         for (&id, &hwnd) in &self.controls {
-            let visible = match id { 100..=199 => page == 0, 200..=299 => page == 1, 300..=399 => page == 2, PROGRESS => self.busy, _ => true };
+            let visible = match id { 100..=199 => page == 0, 200..=299 => page == 1, 300..=399 => page == 2, 400..=499 => page == 3, PROGRESS => self.busy, _ => true };
             unsafe { ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE }); }
         }
         unsafe { SendMessageW(self.control(TAB), TCM_SETCURSEL, page as usize, 0); }
@@ -235,6 +292,57 @@ impl Ui {
             SendMessageW(hwnd, WM_SETREDRAW, 1, 0); InvalidateRect(hwnd, null(), 1);
         }
         self.rendering = false;
+    }
+    fn render_bit_rows(&mut self) {
+        self.rendering = true;
+        let hwnd = self.control(BIT_FILES);
+        unsafe { SendMessageW(hwnd, WM_SETREDRAW, 0, 0); SendMessageW(hwnd, LVM_DELETEALLITEMS, 0, 0); }
+        let Some(scan) = self.bit_scan.as_ref() else {
+            unsafe { SendMessageW(hwnd, WM_SETREDRAW, 1, 0); }
+            self.rendering = false;
+            return;
+        };
+        for (row, item) in scan.profiles.iter().enumerate() {
+            let status = if scan.current_ids.contains(&item.id) { "当前窗口" } else { "疑似残留" };
+            let size = if status == "当前窗口" { "已保护".to_string() } else { format_size(item.size) };
+            let files = if status == "当前窗口" { "-".to_string() } else { item.files.to_string() };
+            let path = item.path.display().to_string();
+            let columns = [
+                status,
+                item.id.as_str(),
+                size.as_str(),
+                files.as_str(),
+                path.as_str(),
+            ];
+            for (column, text) in columns.iter().enumerate() {
+                let mut value = wide(*text);
+                let item_view = LVITEMW { mask: LVIF_TEXT, iItem: row as i32, iSubItem: column as i32, pszText: value.as_mut_ptr(), ..unsafe { std::mem::zeroed() } };
+                unsafe { SendMessageW(hwnd, if column == 0 { LVM_INSERTITEMW } else { LVM_SETITEMW }, 0, &item_view as *const _ as isize); }
+            }
+        }
+        // A fresh scan stores only the profile directories. Checkboxes are set
+        // by the command handler after the orphan list has been computed.
+        unsafe { SendMessageW(hwnd, WM_SETREDRAW, 1, 0); InvalidateRect(hwnd, null(), 1); }
+        self.rendering = false;
+    }
+
+    fn checked_bit(&self) -> Vec<bitbrowser::Candidate> {
+        let Some(scan) = self.bit_scan.as_ref() else { return Vec::new(); };
+        scan.profiles.iter().enumerate()
+            .filter(|(index, item)| {
+                !scan.current_ids.contains(&item.id) && unsafe { SendMessageW(self.control(BIT_FILES), LVM_GETITEMSTATE, *index, LVIS_STATEIMAGEMASK as isize) } >> 12 == 2
+            })
+            .map(|(_, item)| item.clone())
+            .collect()
+    }
+
+    fn set_bit_checks(&self, only_orphans: bool, checked: bool) {
+        let Some(scan) = self.bit_scan.as_ref() else { return; };
+        for (index, item) in scan.profiles.iter().enumerate() {
+            if only_orphans && scan.current_ids.contains(&item.id) { continue; }
+            let state = LVITEMW { stateMask: LVIS_STATEIMAGEMASK, state: if checked { 0x2000 } else { 0x1000 }, ..unsafe { std::mem::zeroed() } };
+            unsafe { SendMessageW(self.control(BIT_FILES), LVM_SETITEMSTATE, index, &state as *const _ as isize); }
+        }
     }
     fn render_app_rows(&mut self) {
         self.rendering = true;
@@ -299,6 +407,9 @@ impl Ui {
             EnableWindow(self.control(OPEN_TARGET), record.as_ref().is_some_and(|r| r.target.exists()) as i32);
             EnableWindow(self.control(PURGE_HISTORY), (!self.busy && self.records.iter().any(|r| r.copies_released && [Phase::Restored, Phase::RolledBack].contains(&r.phase))) as i32);
             EnableWindow(self.control(CLEAN), (!self.busy && !self.disk_items.is_empty()) as i32);
+            EnableWindow(self.control(BIT_SCAN), !self.busy as i32);
+            EnableWindow(self.control(BIT_SELECT_ALL), (!self.busy && self.bit_scan.is_some()) as i32);
+            EnableWindow(self.control(BIT_CLEAN), (!self.busy && self.bit_scan.is_some() && !self.checked_bit().is_empty()) as i32);
         }
         if let Some(a) = app {
             let reason = if a.protection.is_empty() { if a.command.is_empty() { "未登记卸载程序；不会直接删除软件目录" } else { "使用原卸载程序；不自动清理疑似残留" } } else { &a.protection };
@@ -460,6 +571,34 @@ impl Ui {
                     Event::Action(result, false)
                 });
             },
+            BIT_CHOOSE => if let Some(path) = self.folder() {
+                self.text(BIT_ROOT, &path.display().to_string());
+                self.bit_scan = None; self.render_rows(BIT_FILES, Vec::new()); self.update_selection();
+            },
+            BIT_SCAN => {
+                let root = PathBuf::from(self.get_text(BIT_ROOT).trim().trim_matches('"'));
+                if root.as_os_str().is_empty() { self.show_error("请选择比特浏览器 BrowserCache 目录"); return; }
+                self.start("正在读取比特浏览器窗口列表并扫描缓存…", move |cancel, _tx, _| Event::Bit(bitbrowser::scan(&root, &cancel)));
+            }
+            BIT_SELECT_ALL => {
+                let all_checked = self.checked_bit().len() == self.bit_scan.as_ref().map(|scan| scan.orphaned).unwrap_or(0);
+                self.set_bit_checks(true, !all_checked);
+                self.update_selection();
+            }
+            BIT_CLEAN => {
+                let Some(scan) = self.bit_scan.clone() else { return; };
+                let selected = self.checked_bit();
+                if selected.is_empty() { self.show_error("请先勾选疑似残留的窗口目录"); return; }
+                let bytes: u64 = selected.iter().map(|item| item.size).sum();
+                if self.confirm("清理比特浏览器残留", &format!("将永久删除 {} 个疑似残留窗口目录，预计释放 {}。\r\n\r\n清理前会重新读取比特浏览器当前窗口列表；如果目录已重新关联到窗口，将自动跳过。\r\n\r\n此操作不可撤销，建议先备份 BrowserCache。是否继续？", selected.len(), format_size(bytes))) {
+                    self.start("正在复核窗口列表并清理残留…", move |cancel, tx, data| {
+                        let result = bitbrowser::clean(&scan, &selected, &cancel, &|m| { let _ = tx.send(Event::Progress(m)); })
+                            .map(|out| format!("已清理 {} 个残留窗口、{}；跳过 {} 个目录{}", out.deleted, format_size(out.bytes), out.skipped, if out.cancelled { "，操作已取消" } else { "" }));
+                        platform::log_action(&data, "bitbrowser-clean", result.as_deref().unwrap_or("清理未完成"));
+                        Event::Action(result, false)
+                    });
+                }
+            }
             ADMIN => {
                 if let Ok(exe) = std::env::current_exe() {
                     let mut info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
@@ -508,6 +647,28 @@ impl Ui {
                     }
                     latest_progress = None;
                 }
+                Event::Bit(result) => {
+                    self.set_busy(false);
+                    match result {
+                        Ok(scan) => {
+                            if scan.cancelled {
+                                self.bit_scan = None; self.render_rows(BIT_FILES, Vec::new());
+                                self.text(STATUS, "比特浏览器扫描已取消，未删除任何目录");
+                                latest_progress = None;
+                                continue;
+                            }
+                            let total = scan.profiles.len(); let orphaned = scan.orphaned; let bytes = scan.orphan_bytes;
+                            self.bit_scan = Some(scan);
+                            self.render_bit_rows();
+                            self.set_bit_checks(true, true);
+                            self.update_selection();
+                            let limited = self.bit_scan.as_ref().is_some_and(|s| s.limited);
+                            self.text(STATUS, &format!("扫描完成：当前窗口 {} 个，本地目录 {} 个，疑似残留 {} 个、{}{}。", self.bit_scan.as_ref().map(|s| s.current_windows).unwrap_or(0), total, orphaned, format_size(bytes), if limited { "（部分目录文件数达到上限）" } else { "" }));
+                        }
+                        Err(error) => { self.bit_scan = None; self.render_rows(BIT_FILES, Vec::new()); self.text(STATUS, "比特浏览器扫描未完成，未删除任何目录"); self.show_error(&error); }
+                    }
+                    latest_progress = None;
+                }
                 Event::History(result) => {
                     match result {
                         Ok(history) => {
@@ -524,7 +685,8 @@ impl Ui {
                     self.set_busy(false); latest_progress = None;
                     match result { Ok(text) => { self.text(STATUS, &text); }, Err(e) => { self.text(STATUS, "操作未完成，详见提示与迁移记录"); self.show_error(&e); } }
                     // 清理完成后丢弃旧快照，避免重复执行和显示已经删除的条目。
-        if self.page == 1 { if let Some(scan) = self.disk_scan.take() { disk::discard(&scan); } self.disk_items.clear(); self.render_rows(FILES, Vec::new()); self.update_selection(); }
+                    if self.page == 1 { if let Some(scan) = self.disk_scan.take() { disk::discard(&scan); } self.disk_items.clear(); self.render_rows(FILES, Vec::new()); self.update_selection(); }
+                    if self.page == 3 { self.bit_scan = None; self.render_rows(BIT_FILES, Vec::new()); self.update_selection(); }
                     if let Some(items) = self.pending_residues.take() {
                         let has_items = !items.is_empty();
                         self.review_residues(items);
@@ -624,7 +786,7 @@ pub fn run() {
     let scale = unsafe { GetDpiForSystem() }.max(96) as f32 / 96.0;
     let font = unsafe { CreateFontW(-(15.0 * scale) as i32, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32, CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32, wide("Microsoft YaHei UI").as_ptr()) };
     let title_font = unsafe { CreateFontW(-(28.0 * scale) as i32, 0, 0, 0, FW_SEMIBOLD as i32, 0, 0, 0, DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32, CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32, wide("Microsoft YaHei UI").as_ptr()) };
-    let ui = Box::new(Ui { hwnd: null_mut(), controls: HashMap::new(), font, title_font, scale, page: 0, apps: Vec::new(), filtered: Vec::new(), disk_scan: None, disk_items: Vec::new(), records: Vec::new(), data, busy: false, rendering: false, closing: false, cancel: Arc::new(AtomicBool::new(false)), tx, rx, smoke: std::env::args().any(|a| a == "--ui-smoke").then(Instant::now), pending_residues: None });
+    let ui = Box::new(Ui { hwnd: null_mut(), controls: HashMap::new(), font, title_font, scale, page: 0, apps: Vec::new(), filtered: Vec::new(), disk_scan: None, disk_items: Vec::new(), records: Vec::new(), data, busy: false, rendering: false, closing: false, cancel: Arc::new(AtomicBool::new(false)), tx, rx, smoke: std::env::args().any(|a| a == "--ui-smoke").then(Instant::now), pending_residues: None, bit_scan: None });
     let pointer = Box::into_raw(ui);
     unsafe {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES });
